@@ -824,7 +824,11 @@ import {
   createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile,
   signOut, sendPasswordResetEmail, setPersistence, browserLocalPersistence, browserSessionPersistence
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import { getDatabase, ref, onValue, set, update, get } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+import { getDatabase, ref as rref, get as rget } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+import {
+  initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
+  doc, collection, query, where, documentId, onSnapshot, getDoc, getDocFromCache, writeBatch, FieldPath, deleteField
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 /* ---------- Firebase ---------- */
 const firebaseConfig = {
@@ -839,7 +843,10 @@ const firebaseConfig = {
 const fbApp = initializeApp(firebaseConfig);
 const auth = getAuth(fbApp);
 auth.languageCode = 'ko';
-const db = getDatabase(fbApp);
+const rtdb = getDatabase(fbApp);
+let fs;
+try { fs = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) }); }
+catch (e) { fs = getFirestore(fbApp); }
 window.__lylBooted = true;
 
 /* ---------- helpers ---------- */
@@ -943,7 +950,8 @@ const emptyData = () => ({ profile: null, days: {}, plans: {}, notes: [], thumbs
 const now0 = new Date();
 const S = {
   authReady: false, user: null, uid: null, unsubs: [],
-  online: true, graceOver: false, dbError: '',
+  online: navigator.onLine !== false, graceOver: false, dbError: '', migrating: '', migrateErr: '',
+  monthStudy: {}, monthPlans: {}, loadedMonths: new Set(), docExists: new Set(), liveFrom: '', monthUnsubs: null,
   data: emptyData(), fullCache: new Map(), ansCache: new Map(),
   ui: {
     authView: 'start', authErr: '', authMsg: '', authBusy: false, showPw: false, keep: true, invalid: '',
@@ -1023,52 +1031,231 @@ function errMsg(e) {
   return '저장하지 못했어요. 인터넷 연결을 확인하고 다시 해 주세요.';
 }
 
-/* ---------- store (Realtime Database) ---------- */
-const uref = (p) => ref(db, 'users/' + S.uid + (p ? '/' + p : ''));
-function wr(p, v) {
+/* ---------- store (Cloud Firestore) ----------
+   users/{uid}                      profile: subjects, timer, dday, lastSubject, routines, migratedAt
+   users/{uid}/study/{YYYY-MM}      d.{YYYY-MM-DD}.sessions / breaks
+   users/{uid}/plans/{YYYY-MM}      d.{YYYY-MM-DD}.tasks / routine
+   users/{uid}/noteIdx/{YYYY}       n.{noteId}: note fields (one small doc per year)
+   users/{uid}/thumbs|images|answers/{noteId}   { data } photos, read cache-first
+   App code writes with RTDB-like paths ("days/2026-11-03/sessions/r1"); fsWrite maps them onto these docs. */
+const ymOf = (key) => String(key).slice(0, 7);
+const monthKeyOffset = (delta) => { const n = new Date(); const d = new Date(n.getFullYear(), n.getMonth() + delta, 1); return d.getFullYear() + '-' + pad(d.getMonth() + 1); };
+function noteShard(id) {
+  const t = parseInt(String(id).slice(1, 9), 36), y = new Date(t).getFullYear();
+  return (y > 2020 && y < 2100) ? String(y) : 'misc';
+}
+function mapPath(p) {
+  const seg = String(p).split('/'), u = 'users/' + S.uid;
+  switch (seg[0]) {
+    case 'profile': return { doc: u, field: seg.slice(1) };
+    case 'days': return { doc: u + '/study/' + ymOf(seg[1]), field: ['d', seg[1]].concat(seg.slice(2)) };
+    case 'plans': return { doc: u + '/plans/' + ymOf(seg[1]), field: ['d', seg[1]].concat(seg.slice(2)) };
+    case 'notes': return { doc: u + '/noteIdx/' + noteShard(seg[1]), field: ['n', seg[1]].concat(seg.slice(2)) };
+    case 'noteThumbs': return { doc: u + '/thumbs/' + seg[1], blob: true };
+    case 'noteImages': return { doc: u + '/images/' + seg[1], blob: true };
+    case 'noteAnswers': return { doc: u + '/answers/' + seg[1], blob: true };
+  }
+  throw new Error('unknown path ' + p);
+}
+function setNested(o, segs, v) {
+  let n = o;
+  for (let i = 0; i < segs.length - 1; i++) { if (!n[segs[i]] || typeof n[segs[i]] !== 'object') n[segs[i]] = {}; n = n[segs[i]]; }
+  n[segs[segs.length - 1]] = v;
+}
+function fsWrite(obj) {
   if (!S.uid) return Promise.resolve();
-  const pr = set(uref(p), clean(v));
+  const byDoc = new Map();
+  Object.keys(obj).forEach((p) => {
+    const m = mapPath(p);
+    if (!byDoc.has(m.doc)) byDoc.set(m.doc, { blob: !!m.blob, ops: [] });
+    byDoc.get(m.doc).ops.push({ field: m.field, v: clean(obj[p]) });
+  });
+  const batch = writeBatch(fs);
+  byDoc.forEach((d, path) => {
+    const r = doc(fs, path);
+    if (d.blob) {
+      const v = d.ops[d.ops.length - 1].v;
+      if (v == null) batch.delete(r); else batch.set(r, typeof v === 'string' ? { data: v } : v);
+      return;
+    }
+    if (S.docExists.has(path)) {
+      const args = [];
+      d.ops.forEach((o) => { args.push(new FieldPath(...o.field), o.v == null ? deleteField() : o.v); });
+      batch.update(r, ...args);
+    } else {
+      const nested = {};
+      d.ops.forEach((o) => setNested(nested, o.field, o.v == null ? deleteField() : o.v));
+      batch.set(r, nested, { merge: true });
+      S.docExists.add(path);
+    }
+  });
+  const pr = batch.commit();
   pr.catch((e) => toast(errMsg(e)));
   return pr;
 }
-function wrMany(obj) {
-  if (!S.uid) return Promise.resolve();
-  const pr = update(uref(''), clean(obj));
-  pr.catch((e) => toast(errMsg(e)));
-  return pr;
-}
+const wr = (p, v) => fsWrite({ [p]: v });
+const wrMany = (obj) => fsWrite(obj);
+
 let renderQueued = false;
 function changed() {
   if (!renderQueued) { renderQueued = true; requestAnimationFrame(() => { renderQueued = false; renderAll(); }); }
 }
 function onDbErr(e) { S.dbError = isPerm(e) ? 'perm' : 'other'; renderBanner(); }
+function rebuildDays() {
+  const days = {}, plans = {};
+  Object.keys(S.monthStudy).sort().forEach((ym) => Object.assign(days, (S.monthStudy[ym] && S.monthStudy[ym].d) || {}));
+  Object.keys(S.monthPlans).sort().forEach((ym) => Object.assign(plans, (S.monthPlans[ym] && S.monthPlans[ym].d) || {}));
+  S.data.days = days; S.data.plans = plans;
+}
+function subMonths() {
+  if (S.monthUnsubs) S.monthUnsubs.forEach((f) => { try { f(); } catch (e) {} });
+  const u = 'users/' + S.uid, from = monthKeyOffset(-2);
+  S.liveFrom = from;
+  const listen = (col, store) => onSnapshot(query(collection(fs, u + '/' + col), where(documentId(), '>=', from)), (qs) => {
+    Object.keys(store).forEach((ym) => { if (ym >= from) delete store[ym]; });
+    qs.docs.forEach((d) => { store[d.id] = d.data(); S.docExists.add(u + '/' + col + '/' + d.id); });
+    rebuildDays(); changed();
+  }, onDbErr);
+  S.monthUnsubs = [listen('study', S.monthStudy), listen('plans', S.monthPlans)];
+}
+function ensureMonth(ym) {
+  if (!S.uid || !ym || ym >= S.liveFrom || S.loadedMonths.has(ym)) return;
+  S.loadedMonths.add(ym);
+  const u = 'users/' + S.uid, uid = S.uid;
+  Promise.all(['study', 'plans'].map((col) => getDoc(doc(fs, u + '/' + col + '/' + ym)).then((s) => {
+    if (S.uid !== uid) return;
+    if (s.exists()) { S.docExists.add(u + '/' + col + '/' + ym); (col === 'study' ? S.monthStudy : S.monthPlans)[ym] = s.data(); }
+  }))).then(() => { if (S.uid === uid) { rebuildDays(); changed(); } }).catch(() => { S.loadedMonths.delete(ym); });
+}
+function ensureRange(fromTs, toTs) {
+  const a = new Date(fromTs), b = new Date(toTs - 1);
+  for (let d = new Date(a.getFullYear(), a.getMonth(), 1); d <= b; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) ensureMonth(d.getFullYear() + '-' + pad(d.getMonth() + 1));
+}
 function startStore(uid) {
   stopStore();
-  S.uid = uid; S.data = emptyData(); S.fullCache.clear(); S.ansCache.clear(); S.dbError = ''; S.graceOver = false;
-  S.unsubs.push(onValue(uref('profile'), (s) => { S.data.profile = s.val(); changed(); }, onDbErr));
-  S.unsubs.push(onValue(uref('days'), (s) => { S.data.days = s.val() || {}; changed(); }, onDbErr));
-  S.unsubs.push(onValue(uref('plans'), (s) => { S.data.plans = s.val() || {}; changed(); }, onDbErr));
-  S.unsubs.push(onValue(uref('notes'), (s) => {
-    const v = s.val() || {};
-    S.data.notes = Object.keys(v).map((k) => Object.assign({ id: k }, v[k])).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  Object.assign(S, { uid: uid, data: emptyData(), dbError: '', graceOver: false, monthStudy: {}, monthPlans: {}, loadedMonths: new Set(), docExists: new Set(), migrating: '', migrateErr: '' });
+  S.fullCache.clear(); S.ansCache.clear(); thumbLoading.clear(); thumbMissing.clear();
+  const u = 'users/' + uid;
+  S.unsubs.push(onSnapshot(doc(fs, u), (s) => {
+    if (s.exists()) S.docExists.add(u); else S.docExists.delete(u);
+    S.data.profile = s.exists() ? s.data() : null;
+    if (!s.metadata.fromCache && !S.migrationChecked) { S.migrationChecked = true; if (!(S.data.profile && S.data.profile.migratedAt)) migrateFromRtdb(uid); }
     changed();
   }, onDbErr));
-  S.unsubs.push(onValue(uref('noteThumbs'), (s) => { S.data.thumbs = s.val() || {}; changed(); }, onDbErr));
-  S.unsubs.push(onValue(ref(db, '.info/connected'), (s) => { S.online = s.val() === true; renderBanner(); }));
-  setTimeout(() => { S.graceOver = true; renderBanner(); }, 5000);
+  S.unsubs.push(onSnapshot(collection(fs, u + '/noteIdx'), (qs) => {
+    const list = [];
+    qs.docs.forEach((d) => {
+      S.docExists.add(u + '/noteIdx/' + d.id);
+      const n = (d.data() && d.data().n) || {};
+      Object.keys(n).forEach((id) => { if (n[id] && typeof n[id] === 'object') list.push(Object.assign({ id: id }, n[id])); });
+    });
+    S.data.notes = list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    changed();
+  }, onDbErr));
+  subMonths();
+  setTimeout(() => { S.graceOver = true; renderBanner(); }, 4000);
 }
 function stopStore() {
-  S.unsubs.forEach((u) => { try { u(); } catch (e) {} });
-  S.unsubs = []; S.uid = null;
+  S.unsubs.forEach((f) => { try { f(); } catch (e) {} });
+  if (S.monthUnsubs) S.monthUnsubs.forEach((f) => { try { f(); } catch (e) {} });
+  S.unsubs = []; S.monthUnsubs = null; S.uid = null; S.migrationChecked = false;
   S.data = emptyData(); S.fullCache.clear(); S.ansCache.clear();
+}
+
+/* photos: cache-first, so a photo downloads once per device */
+const thumbLoading = new Set(), thumbMissing = new Set();
+function fetchBlob(col, id) {
+  const r = doc(fs, 'users/' + S.uid + '/' + col + '/' + id);
+  return getDocFromCache(r).then((s) => { if (!s.exists()) throw 0; return s.data(); })
+    .catch(() => getDoc(r).then((s) => (s.exists() ? s.data() : null)))
+    .catch(() => null);
+}
+function thumbOf(id) {
+  const t = S.data.thumbs[id];
+  if (t) return t;
+  if (S.uid && !thumbLoading.has(id) && !thumbMissing.has(id)) {
+    thumbLoading.add(id);
+    const uid = S.uid;
+    fetchBlob('thumbs', id).then((d) => {
+      thumbLoading.delete(id);
+      if (S.uid !== uid) return;
+      if (d && d.data) { S.data.thumbs[id] = d.data; changed(); } else thumbMissing.add(id);
+    });
+  }
+  return '';
 }
 function getFull(id) {
   if (S.fullCache.has(id)) return Promise.resolve(S.fullCache.get(id));
-  return get(uref('noteImages/' + id)).then((s) => {
-    const v = s.val() || S.data.thumbs[id] || '';
-    if (v) S.fullCache.set(id, v);
+  return fetchBlob('images', id).then((d) => {
+    const v = (d && d.data) || S.data.thumbs[id] || '';
+    if (d && d.data) S.fullCache.set(id, v);
     return v;
-  }).catch(() => S.data.thumbs[id] || '');
+  });
+}
+function getAns(id) {
+  const n = S.data.notes.find((x) => x.id === id), want = n ? n.ansV : undefined;
+  const c = S.ansCache.get(id);
+  if (c && c.v === want) return Promise.resolve(c.data);
+  const r = doc(fs, 'users/' + S.uid + '/answers/' + id);
+  return getDocFromCache(r).then((s) => { const d = s.exists() ? s.data() : null; if (!d || d.v !== want) throw 0; return d; })
+    .catch(() => getDoc(r).then((s) => (s.exists() ? s.data() : null)))
+    .then((d) => { if (!d || !d.data) return ''; S.ansCache.set(id, { data: d.data, v: d.v }); return d.data; })
+    .catch(() => '');
+}
+
+/* one-time move from the old Realtime Database */
+async function migrateFromRtdb(uid) {
+  if (S.migratingNow) return;
+  S.migratingNow = true;
+  const u = 'users/' + uid;
+  try {
+    S.migrating = '예전 기록을 확인하는 중이에요…'; renderBanner();
+    const snap = await rget(rref(rtdb, 'users/' + uid));
+    const v = snap.val();
+    const ops = [];
+    if (v && typeof v === 'object') {
+      const p = v.profile || {}, prof = {};
+      ['subjects', 'timer', 'dday', 'lastSubject', 'routines'].forEach((k) => { if (p[k] != null) prof[k] = p[k]; });
+      if (prof.routines) Object.keys(prof.routines).forEach((id) => { const r = prof.routines[id]; if (r && r.days && !Array.isArray(r.days)) r.days = Object.values(r.days); });
+      if (Object.keys(prof).length) ops.push([u, prof, true]);
+      const byMonth = (src) => { const m = {}; Object.keys(src || {}).forEach((k) => { if (/^\d{4}-\d{2}-\d{2}$/.test(k)) (m[ymOf(k)] = m[ymOf(k)] || {})[k] = src[k]; }); return m; };
+      const sm = byMonth(v.days), pm = byMonth(v.plans);
+      Object.keys(sm).forEach((ym) => ops.push([u + '/study/' + ym, { d: sm[ym] }, true]));
+      Object.keys(pm).forEach((ym) => ops.push([u + '/plans/' + ym, { d: pm[ym] }, true]));
+      const ans = v.noteAnswers || {}, shards = {};
+      Object.keys(v.notes || {}).forEach((id) => {
+        const n = Object.assign({}, v.notes[id]);
+        n.hasAns = !!ans[id];
+        if (n.hasAns) n.ansV = n.ansV || 1;
+        const s = noteShard(id); (shards[s] = shards[s] || {})[id] = n;
+      });
+      Object.keys(shards).forEach((s) => ops.push([u + '/noteIdx/' + s, { n: shards[s] }, true]));
+      Object.keys(v.noteThumbs || {}).forEach((id) => ops.push([u + '/thumbs/' + id, { data: v.noteThumbs[id] }, false]));
+      Object.keys(v.noteImages || {}).forEach((id) => ops.push([u + '/images/' + id, { data: v.noteImages[id] }, false]));
+      Object.keys(ans).forEach((id) => ops.push([u + '/answers/' + id, { data: ans[id], v: (v.notes && v.notes[id] && v.notes[id].ansV) || 1 }, false]));
+    }
+    const total = ops.length;
+    let i = 0;
+    while (i < ops.length) {
+      const batch = writeBatch(fs);
+      let bytes = 0, n = 0;
+      while (i < ops.length && n < 400) {
+        const sz = JSON.stringify(ops[i][1]).length;
+        if (n > 0 && bytes + sz > 7000000) break;
+        const o = ops[i];
+        if (o[2]) batch.set(doc(fs, o[0]), o[1], { merge: true }); else batch.set(doc(fs, o[0]), o[1]);
+        bytes += sz; n++; i++;
+      }
+      S.migrating = '예전 기록을 새 저장소로 옮기는 중이에요… (' + i + '/' + total + ')'; renderBanner();
+      await batch.commit();
+    }
+    const fin = writeBatch(fs); fin.set(doc(fs, u), { migratedAt: Date.now() }, { merge: true }); await fin.commit();
+    S.migrating = ''; renderBanner();
+    if (total) toast('예전 기록을 모두 옮겼어요');
+  } catch (e) {
+    S.migrating = ''; S.migrateErr = '예전 기록을 옮기지 못했어요. 인터넷 연결을 확인하고 새로고침하면 다시 시도해요.';
+    renderBanner();
+  } finally { S.migratingNow = false; }
 }
 
 /* ---------- study records ---------- */
@@ -1341,6 +1528,7 @@ function syncCalToSelected() { const d = dayAt(S.ui.planOff); S.ui.calY = d.getF
 function calendarHtml() {
   const u = S.ui, y = u.calY, m = u.calM, now = Date.now();
   const first = new Date(y, m, 1), n = new Date(y, m + 1, 0).getDate(), lead = (first.getDay() + 6) % 7;
+  ensureMonth(y + '-' + pad(m + 1));
   const tkey = keyOf(new Date()), selKey = curPlanKey();
   const isThis = y === new Date().getFullYear() && m === new Date().getMonth();
   let monthMs = 0, h = '';
@@ -1365,7 +1553,9 @@ function calendarHtml() {
 }
 
 function dayPanelHtml(land) {
-  const u = S.ui, off = u.planOff, sel = dayAt(off), now = Date.now(), key = keyOf(sel), tasks = dayTasks(key);
+  const u = S.ui, off = u.planOff, sel = dayAt(off), now = Date.now(), key = keyOf(sel);
+  { const wb = (sel.getDay() + 6) % 7; ensureRange(new Date(sel.getFullYear(), sel.getMonth(), sel.getDate() - wb).getTime(), new Date(sel.getFullYear(), sel.getMonth(), sel.getDate() - wb + 7).getTime()); }
+  const tasks = dayTasks(key);
   const rel = off === 0 ? '오늘' : off === -1 ? '어제' : off === 1 ? '내일' : off > 1 ? off + '일 후' : (-off) + '일 전';
   const relKind = off === 0 ? 'today' : off > 0 ? 'future' : 'past';
   const title = (sel.getFullYear() !== new Date().getFullYear() ? sel.getFullYear() + '년 ' : '') + longDate(sel);
@@ -1636,7 +1826,7 @@ function renderNotes() {
   } else {
     h += '<div class="note-grid">';
     notes.forEach((n) => {
-      const src = S.data.thumbs[n.id] || '';
+      const src = thumbOf(n.id);
       const img = src ? '<img class="note-img" src="' + esc(src) + '" alt="">' : '<span class="note-ph"></span>';
       const tag = '<span class="tag">' + (n.slot != null ? '<span class="dot" style="background:var(--s' + slotNum(n.slot) + ')"></span>' : '') + '<span class="ellip">' + esc(n.subject) + '</span></span>';
       const meta = '<div class="note-meta">' + tag + '<span class="sub small">' + noteDate(n) + '</span></div>' + (n.unit ? '<p class="note-unit ellip">' + esc(n.unit) + '</p>' : '');
@@ -1681,7 +1871,7 @@ function renderNsheet(nArg) {
   const n = nArg || S.data.notes.find((x) => x.id === ne.id); if (!n) { closeNsheet(); return; }
   const subs = noteSubjects();
   if (!subs.some((s) => s.name === ne.subject)) subs.push({ name: ne.subject, slot: n.slot != null ? slotNum(n.slot) : null });
-  let h = '<div class="ns-top"><img class="ans-thumb" src="' + esc(S.data.thumbs[n.id] || '') + '" alt="문제 사진"><p class="sub">' + noteDate(n) + '에 등록한 문제</p></div>';
+  let h = '<div class="ns-top"><img class="ans-thumb" src="' + esc(thumbOf(n.id)) + '" alt="문제 사진"><p class="sub">' + noteDate(n) + '에 등록한 문제</p></div>';
   h += '<div class="field"><span class="label" id="lbl-nss">과목</span><div class="chips" role="group" aria-labelledby="lbl-nss">' + subs.map((s) => '<button type="button" class="chip" data-act="ns-subject" data-v="' + esc(s.name) + '" aria-pressed="' + (ne.subject === s.name) + '">' + (s.slot != null ? '<span class="dot" style="background:var(--s' + s.slot + ')"></span>' : '') + esc(s.name) + '</button>').join('') + '</div></div>';
   h += '<div class="sheet-fields"><div class="field"><label class="label" for="ns-unit">단원</label><input id="ns-unit" type="text" maxlength="30" list="ns-unit-list" placeholder="예: 이차함수"><datalist id="ns-unit-list">' + unitsFor(ne.subject).map((x) => '<option value="' + esc(x) + '"></option>').join('') + '</datalist></div><div class="field"><label class="label" for="ns-memo">메모</label><input id="ns-memo" type="text" maxlength="60" placeholder="예: 계산 실수"></div></div>';
   const hasAns = ne.a ? true : (n.hasAns && !ne.removeAns);
@@ -1705,7 +1895,7 @@ function submitNsheet() {
   obj[p + 'slot'] = sObj && sObj.slot != null ? sObj.slot : (ne.subject === n.subject && n.slot != null ? n.slot : null);
   obj[p + 'unit'] = ($('#ns-unit').value || '').trim().slice(0, 30);
   obj[p + 'memo'] = ($('#ns-memo').value || '').trim().slice(0, 60);
-  if (ne.a) { obj['noteAnswers/' + id] = ne.a.full; obj[p + 'hasAns'] = true; S.ansCache.set(id, ne.a.full); }
+  if (ne.a) { const av = Date.now(); obj['noteAnswers/' + id] = { data: ne.a.full, v: av }; obj[p + 'hasAns'] = true; obj[p + 'ansV'] = av; S.ansCache.set(id, { data: ne.a.full, v: av }); }
   else if (ne.removeAns) { obj['noteAnswers/' + id] = null; obj[p + 'hasAns'] = false; S.ansCache.delete(id); }
   if (ne.reset) { obj[p + 'stage'] = 0; obj[p + 'mastered'] = false; obj[p + 'nextKey'] = keyOf(dayAt(1)); }
   wrMany(obj);
@@ -1773,6 +1963,7 @@ function drawRateChart() {
 }
 function renderStats() {
   const u = S.ui, now = Date.now(), R = periodRange(u.statPer, u.statOff);
+  ensureRange(R.prevFrom, R.to);
   const sess = sessionsIn(R.from, R.to, now), brks = breaksIn(R.from, R.to);
   const total = sumMs(sess), brkMs = sumMs(brks), prevTotal = sumMs(sessionsIn(R.prevFrom, R.prevTo, now));
   const rows = bySubject(sess);
@@ -2071,7 +2262,9 @@ function renderBanner() {
   const b = $('#banner'); let msg = '';
   if (S.dbError === 'perm') msg = '기록에 접근할 권한이 없어요. Firebase 콘솔의 Realtime Database 규칙을 확인해 주세요.';
   else if (S.dbError) msg = '기록을 불러오지 못했어요. 페이지를 새로고침해 주세요.';
-  else if (S.uid && !S.online && S.graceOver) msg = '인터넷에 연결되어 있지 않아요. 연결되면 자동으로 저장돼요. 그 전에 페이지를 닫으면 저장되지 않을 수 있어요.';
+  else if (S.migrateErr) msg = S.migrateErr;
+  else if (S.migrating) msg = S.migrating;
+  else if (S.uid && !S.online) msg = '인터넷에 연결되어 있지 않아요. 기록은 이 기기에 저장해 두었다가 연결되면 자동으로 올라가요.';
   if (b.textContent !== msg) b.textContent = msg;
   b.hidden = !msg;
 }
@@ -2126,10 +2319,6 @@ function encodeImage(src) {
   let side = 1500, q = 0.82, full = '';
   for (let k = 0; k < 6; k++) { full = drawJpeg(src, side, q); if (full.length < 450000) break; side = Math.round(side * 0.85); q = Math.max(0.55, q - 0.06); }
   return { full: full, thumb: drawJpeg(src, 520, 0.72) };
-}
-function getAns(id) {
-  if (S.ansCache.has(id)) return Promise.resolve(S.ansCache.get(id));
-  return get(uref('noteAnswers/' + id)).then((s) => { const v = s.val() || ''; if (v) S.ansCache.set(id, v); return v; }).catch(() => '');
 }
 
 /* crop & rotate */
@@ -2221,14 +2410,14 @@ function saveNote() {
   const sObj = subs.find((s) => s.name === subject);
   const memo = ($('#note-memo') ? $('#note-memo').value : '').trim().slice(0, 60);
   const unit = ($('#note-unit') ? $('#note-unit').value : '').trim().slice(0, 30);
-  const id = 'n' + genId();
+  const id = 'n' + genId(), av = Date.now();
   S.fullCache.set(id, d.q.full);
   const obj = {
-    ['notes/' + id]: { subject: subject, slot: sObj && sObj.slot != null ? sObj.slot : null, unit: unit, memo: memo, createdAt: Date.now(), hasAns: !!d.a, stage: 0, nextKey: keyOf(dayAt(INTERVALS[0])), tries: 0, rights: 0, mastered: false },
+    ['notes/' + id]: { subject: subject, slot: sObj && sObj.slot != null ? sObj.slot : null, unit: unit, memo: memo, createdAt: Date.now(), hasAns: !!d.a, ansV: d.a ? av : null, stage: 0, nextKey: keyOf(dayAt(INTERVALS[0])), tries: 0, rights: 0, mastered: false },
     ['noteThumbs/' + id]: d.q.thumb,
     ['noteImages/' + id]: d.q.full
   };
-  if (d.a) { obj['noteAnswers/' + id] = d.a.full; S.ansCache.set(id, d.a.full); }
+  if (d.a) { obj['noteAnswers/' + id] = { data: d.a.full, v: av }; S.ansCache.set(id, { data: d.a.full, v: av }); }
   wrMany(obj);
   u.draft = null; u.noteSubject = '';
   renderNotes(); toast('문제를 등록했어요. 내일 복습할 문제로 올라와요');
@@ -2273,7 +2462,7 @@ function renderReview() {
   title.textContent = rv.single ? '문제 보기' : '복습 ' + (rv.i + 1) + ' / ' + rv.ids.length;
   let h = '<div class="rv-meta"><span class="tag">' + (n.slot != null ? '<span class="dot" style="background:var(--s' + slotNum(n.slot) + ')"></span>' : '') + esc(n.subject) + '</span>' + (n.unit ? '<span class="sub">' + esc(n.unit) + '</span>' : '') + '<span class="sub">' + noteDate(n) + ' 등록</span>' + notePill(n) + '</div>';
   if (n.memo) h += '<p class="rv-memo">' + esc(n.memo) + '</p>';
-  h += '<div class="rv-imgs' + (rv.showAns ? ' two' : '') + '"><figure class="rv-fig"><figcaption>문제</figcaption><img id="rv-q" src="' + esc(S.data.thumbs[id] || '') + '" alt="' + esc(n.subject) + ' 문제 사진"></figure>';
+  h += '<div class="rv-imgs' + (rv.showAns ? ' two' : '') + '"><figure class="rv-fig"><figcaption>문제</figcaption><img id="rv-q" src="' + esc(thumbOf(id)) + '" alt="' + esc(n.subject) + ' 문제 사진"></figure>';
   if (rv.showAns) h += '<figure class="rv-fig"><figcaption>해설</figcaption><img id="rv-a" alt="해설 사진"></figure>';
   h += '</div>';
   main.innerHTML = h; main.scrollTop = 0;
@@ -2390,6 +2579,7 @@ async function exportPdf() {
 const hhmm = (ts) => { const d = new Date(ts); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
 function recordsCardHtml(now) {
   const u = S.ui, d = dayAt(u.recOff), key = keyOf(d);
+  ensureMonth(ymOf(key));
   const rows = daySessions(key).map((r) => Object.assign({ kind: 's' }, r)).concat(dayBreaks(key).map((b) => Object.assign({ kind: 'b' }, b))).sort((a, b) => a.start - b.start);
   const l = liveSeg(now), liveHere = l && keyOf(new Date(l.start)) === key;
   let h = '<section class="card" aria-labelledby="h-rec"><div class="card-head"><div><h2 id="h-rec">공부 기록</h2><p class="sub">잘못 잰 시간은 고치거나 지울 수 있어요</p></div><button type="button" class="btn btn-ghost" data-act="rec-add">' + icon('plus', 18, 2) + '<span>직접 추가</span></button></div>';
@@ -2705,6 +2895,8 @@ document.addEventListener('keydown', (e) => {
   });
 });
 $('#main').addEventListener('scroll', hideTip, { passive: true });
+window.addEventListener('online', () => { S.online = true; thumbMissing.clear(); renderBanner(); changed(); });
+window.addEventListener('offline', () => { S.online = false; renderBanner(); });
 window.addEventListener('resize', () => { if (!$('#crop').hidden) layoutCrop(); });
 
 /* swipe between days */
@@ -2759,7 +2951,7 @@ if (window.ResizeObserver) {
 document.addEventListener('visibilitychange', () => { syncWake(); if (document.visibilityState === 'visible') renderAll(); });
 setInterval(() => {
   const k = keyOf(new Date());
-  if (k !== S.ui.todayKey) { S.ui.todayKey = k; renderAll(); return; }
+  if (k !== S.ui.todayKey) { S.ui.todayKey = k; if (S.uid && monthKeyOffset(-2) !== S.liveFrom) subMonths(); renderAll(); return; }
   const t = prof().timer;
   if (!S.uid || !t) return;
   updateTicks();
