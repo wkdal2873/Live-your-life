@@ -1,0 +1,18 @@
+{
+  "name": "Live your life",
+  "short_name": "Live your life",
+  "description": "순공 타이머, 플래너, 오답노트, 통계를 내 계정에 쌓아 가는 학습 관리",
+  "lang": "ko",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#10172E",
+  "theme_color": "#10172E",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
