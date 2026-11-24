@@ -24,7 +24,7 @@
   --good: #1A7A43; --mid: #9A5B00; --bad: #C2352F; --on-status: #FFFFFF; --status-empty: #8A91A5;
   --good-soft: #F1F9F4; --mid-soft: #FFF7E8; --bad-soft: #FDF2F1;
   --good-line: #BFE3CC; --mid-line: #F0D7A6; --bad-line: #F0C9C6;
-  --good-text: #1A7A43; --bad-text: #C2352F;
+  --good-text: #1A7A43; --mid-text: #9A5B00; --bad-text: #C2352F;
   --break: #8E95A9;
   --scrim: rgba(16,23,46,.5); --shadow: 0 1px 3px rgba(20,28,60,.07);
   --toast-bg: #182035; --toast-fg: #FFFFFF;
@@ -44,7 +44,7 @@
     --status-empty: #6E789A;
     --good-soft: #13261C; --mid-soft: #2B2210; --bad-soft: #2E1919;
     --good-line: #24503A; --mid-line: #5A4318; --bad-line: #5E2A2A;
-    --good-text: #6FD39A; --bad-text: #FF8F8A;
+    --good-text: #6FD39A; --mid-text: #F2B65A; --bad-text: #FF8F8A;
     --break: #7C849C;
     --scrim: rgba(0,0,0,.6); --shadow: none;
     --toast-bg: #E8ECF7; --toast-fg: #10172E;
@@ -233,6 +233,9 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .cal-cell { min-height: 74px; min-width: 0; padding: 6px 6px 7px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); display: flex; flex-direction: column; align-items: stretch; gap: 3px; text-align: left; overflow: hidden; }
 .cal-cell.blank { border: none; background: transparent; }
 .cal-num { font-family: var(--font-num); font-size: 16px; font-weight: 600; line-height: 1.2; }
+.cal-top { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 0 4px; min-width: 0; }
+.cal-rate { font-family: var(--font-num); font-size: 13px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rate-hi { color: var(--good-text); } .rate-md { color: var(--mid-text); } .rate-lo { color: var(--bad-text); }
 .cal-cell.is-today { border-color: var(--accent); }
 .cal-cell.is-today .cal-num { color: var(--accent); font-weight: 700; }
 .cal-cell[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
@@ -308,11 +311,17 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .wd-num { font-family: var(--font-num); font-size: 21px; font-weight: 500; line-height: 1.1; }
 .wd-dot { width: 6px; height: 6px; border-radius: 50%; background: transparent; }
 .wd.has .wd-dot { background: var(--accent); }
+.wd-rate { font-family: var(--font-num); font-size: 12px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.day-sum .of { color: var(--muted); }
 .wd.is-today { border-color: var(--accent); }
 .wd.is-today .wd-num { font-weight: 700; }
 .wd[aria-pressed="true"] { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); }
 .wd[aria-pressed="true"] .wd-dow { color: var(--on-accent); opacity: .85; }
 .wd[aria-pressed="true"].has .wd-dot { background: var(--on-accent); }
+.wd[aria-pressed="true"] .wd-rate { color: var(--on-accent); }
+.cal-sub { display: flex; flex-wrap: wrap; justify-content: center; gap: 0 12px; }
+.cal-sub > span { white-space: nowrap; }
+.cal-sub b { font-weight: 700; }
 .swipe { display: flex; flex-direction: column; gap: 12px; min-height: 300px; touch-action: pan-y; transition: transform .22s ease, opacity .22s ease; }
 .swipe.in-right { animation: inRight .24s ease; }
 .swipe.in-left { animation: inLeft .24s ease; }
@@ -608,6 +617,8 @@ input[aria-invalid="true"] { border-color: var(--bad); }
   .cal-cell { min-height: 58px; padding: 4px; border-radius: 9px; }
   .cal-num { font-size: 14px; }
   .cal-time { font-size: 10px; }
+  .cal-rate { font-size: 11px; }
+  .wd-rate { font-size: 11px; }
   .card { padding: 18px; }
   .auth-card { padding: 20px; }
   .hero-card, .dday { padding: 20px; }
@@ -1524,6 +1535,15 @@ function movePickerHtml(target, n) {
   return h + '</div>';
 }
 const rateOf = (c) => (c.total ? (c.done + c.partial * 0.5) / c.total : null);
+/* A day's plan completion for the calendar, week strip and day summary.
+   Today and later days show it only once something is checked, so a fresh day isn't marked 0%. */
+function dayRate(key, c) {
+  if (!c.total) return null;
+  if (!(c.done + c.partial + c.miss) && key >= keyOf(new Date())) return null;
+  return rateOf(c);
+}
+const rateTier = (r) => (r >= 0.8 ? 'rate-hi' : r >= 0.5 ? 'rate-md' : 'rate-lo');
+const rateOfTxt = (c) => c.total + '개 중 ' + c.done + '개' + (c.partial ? ', 애매 ' + c.partial + '개' : '');
 function studyMsOn(key, now) {
   let ms = sumMs(daySessions(key));
   const l = liveSeg(now); if (l && keyOf(new Date(l.start)) === key) ms += l.ms;
@@ -1547,23 +1567,26 @@ function calendarHtml() {
   const tkey = keyOf(new Date()), selKey = curPlanKey();
   const isThis = y === new Date().getFullYear() && m === new Date().getMonth();
   let monthMs = 0, h = '';
+  const mc = { done: 0, partial: 0, total: 0 };
   let cells = '';
   for (let i = 0; i < lead; i++) cells += '<span class="cal-cell blank" aria-hidden="true"></span>';
   for (let d = 1; d <= n; d++) {
-    const dt = new Date(y, m, d), key = keyOf(dt), ms = studyMsOn(key, now), c = countsOf(dayTasks(key));
+    const dt = new Date(y, m, d), key = keyOf(dt), ms = studyMsOn(key, now), c = countsOf(dayTasks(key)), r = dayRate(key, c);
     monthMs += ms;
+    if (r != null) { mc.done += c.done; mc.partial += c.partial; mc.total += c.total; }
     let bar = '';
     if (c.total) {
       const w = (x) => (x / c.total * 100).toFixed(1) + '%';
       bar = '<span class="cal-bar">' + (c.done ? '<span style="width:' + w(c.done) + ';background:var(--good)"></span>' : '') + (c.partial ? '<span style="width:' + w(c.partial) + ';background:var(--mid)"></span>' : '') + (c.miss ? '<span style="width:' + w(c.miss) + ';background:var(--bad)"></span>' : '') + '</span>';
     }
-    const aria = (m + 1) + '월 ' + d + '일 ' + W[dt.getDay()] + '요일' + (key === tkey ? ', 오늘' : '') + (ms ? ', 공부 ' + dur(ms) : '') + (c.total ? ', 계획 ' + c.total + '개 중 ' + c.done + '개 했어요' : '');
-    cells += '<button type="button" class="cal-cell' + (key === tkey ? ' is-today' : '') + '" data-act="cal-pick" data-v="' + key + '" aria-pressed="' + (key === selKey) + '" aria-label="' + esc(aria) + '"><span class="cal-num">' + d + '</span>' + (ms >= 60000 ? '<span class="cal-time">' + hm(ms) + '</span>' : '') + bar + '</button>';
+    const aria = (m + 1) + '월 ' + d + '일 ' + W[dt.getDay()] + '요일' + (key === tkey ? ', 오늘' : '') + (ms ? ', 공부 ' + dur(ms) : '') + (c.total ? ', 계획 ' + c.total + '개 중 ' + c.done + '개 했어요' : '') + (r != null ? ', 이행률 ' + pctTxt(r) : '');
+    cells += '<button type="button" class="cal-cell' + (key === tkey ? ' is-today' : '') + '" data-act="cal-pick" data-v="' + key + '" aria-pressed="' + (key === selKey) + '" aria-label="' + esc(aria) + '"><span class="cal-top"><span class="cal-num">' + d + '</span>' + (r != null ? '<span class="cal-rate ' + rateTier(r) + '">' + pctTxt(r) + '</span>' : '') + '</span>' + (ms >= 60000 ? '<span class="cal-time">' + hm(ms) + '</span>' : '') + bar + '</button>';
   }
-  h += '<section class="card cal" aria-labelledby="h-cal"><div class="cal-head"><button type="button" class="round-btn" data-act="cal-prev" aria-label="이전 달">' + icon('chevL', 22, 2) + '</button><div class="cal-title"><h2 id="h-cal">' + y + '년 ' + (m + 1) + '월</h2><span class="sub small">이 달 공부 ' + dur(monthMs) + '</span></div><button type="button" class="round-btn" data-act="cal-next" aria-label="다음 달">' + icon('chevR', 22, 2) + '</button></div>';
+  const monthRate = rateOf(mc);
+  h += '<section class="card cal" aria-labelledby="h-cal"><div class="cal-head"><button type="button" class="round-btn" data-act="cal-prev" aria-label="이전 달">' + icon('chevL', 22, 2) + '</button><div class="cal-title"><h2 id="h-cal">' + y + '년 ' + (m + 1) + '월</h2><span class="cal-sub sub small"><span>이 달 공부 ' + dur(monthMs) + '</span>' + (monthRate != null ? '<span>평균 이행률 <b class="' + rateTier(monthRate) + '">' + pctTxt(monthRate) + '</b></span>' : '') + '</span></div><button type="button" class="round-btn" data-act="cal-next" aria-label="다음 달">' + icon('chevR', 22, 2) + '</button></div>';
   h += '<div class="cal-dow" aria-hidden="true">' + WK.map((w) => '<span>' + w + '</span>').join('') + '</div>';
   h += '<div class="cal-grid">' + cells + '</div>';
-  h += '<div class="cal-legend"><span><span class="sq sm sq-done"></span>했어요</span><span><span class="sq sm sq-partial"></span>애매해요</span><span><span class="sq sm sq-miss"></span>못했어요</span><span>숫자는 공부 시간</span>' + (isThis ? '' : '<button type="button" class="link-btn" data-act="cal-today">이번 달로</button>') + '</div>';
+  h += '<div class="cal-legend"><span><span class="sq sm sq-done"></span>했어요</span><span><span class="sq sm sq-partial"></span>애매해요</span><span><span class="sq sm sq-miss"></span>못했어요</span><span>%는 계획 이행률, 시간은 공부 시간</span>' + (isThis ? '' : '<button type="button" class="link-btn" data-act="cal-today">이번 달로</button>') + '</div>';
   return h + '</section>';
 }
 
@@ -1579,13 +1602,13 @@ function dayPanelHtml(land) {
     const back = (sel.getDay() + 6) % 7;
     h += '<div class="week" role="group" aria-label="날짜 선택">';
     for (let i = 0; i < 7; i++) {
-      const o = off - back + i, dd = dayAt(o), has = dayTasks(keyOf(dd)).length > 0;
-      h += '<button type="button" class="wd' + (o === 0 ? ' is-today' : '') + (has ? ' has' : '') + '" data-act="pick-day" data-v="' + o + '" aria-pressed="' + (o === off) + '" aria-label="' + longDate(dd) + (o === 0 ? ', 오늘' : '') + (has ? ', 계획 있음' : '') + '"><span class="wd-dow">' + WK[i] + '</span><span class="wd-num">' + dd.getDate() + '</span><span class="wd-dot"></span></button>';
+      const o = off - back + i, dd = dayAt(o), dk = keyOf(dd), dt = dayTasks(dk), has = dt.length > 0, wr0 = has ? dayRate(dk, countsOf(dt)) : null;
+      h += '<button type="button" class="wd' + (o === 0 ? ' is-today' : '') + (has ? ' has' : '') + '" data-act="pick-day" data-v="' + o + '" aria-pressed="' + (o === off) + '" aria-label="' + longDate(dd) + (o === 0 ? ', 오늘' : '') + (wr0 != null ? ', 이행률 ' + pctTxt(wr0) : has ? ', 계획 있음' : '') + '"><span class="wd-dow">' + WK[i] + '</span><span class="wd-num">' + dd.getDate() + '</span>' + (wr0 != null ? '<span class="wd-rate ' + rateTier(wr0) + '">' + pctTxt(wr0) + '</span>' : '<span class="wd-dot"></span>') + '</button>';
     }
     h += '</div>';
   }
-  const c = countsOf(tasks), rate = rateOf(c), ms = studyMsOn(key, now);
-  h += '<div class="day-sum"><span>공부 <strong>' + dur(ms) + '</strong></span><span>계획 <strong>' + c.total + '개</strong></span>' + (c.moved ? '<span>미룸 <strong>' + c.moved + '개</strong></span>' : '') + (rate != null ? '<span>이행률 <strong>' + pctTxt(rate) + '</strong></span>' : '') + '</div>';
+  const c = countsOf(tasks), rate = rateOf(c), shown = dayRate(key, c), ms = studyMsOn(key, now);
+  h += '<div class="day-sum"><span>공부 <strong>' + dur(ms) + '</strong></span><span>계획 <strong>' + c.total + '개</strong></span>' + (c.moved ? '<span>미룸 <strong>' + c.moved + '개</strong></span>' : '') + (rate != null ? '<span>이행률 <strong' + (shown != null ? ' class="' + rateTier(shown) + '"' : '') + '>' + pctTxt(rate) + '</strong> <span class="of">(' + rateOfTxt(c) + ')</span></span>' : '') + '</div>';
   h += '<div id="swipe" class="swipe' + (u.slide ? ' ' + u.slide : '') + '">';
   u.slide = '';
   if (tasks.length) {
